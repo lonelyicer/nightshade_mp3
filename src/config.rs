@@ -10,6 +10,7 @@ use std::{fs, path::PathBuf, time::SystemTime};
 const DISPLAY_WIDTH: usize = 14;
 const MIN_WRITE_STEP_MS: u64 = 20;
 const MIN_SCROLL_INTERVAL_MS: u64 = 100;
+const MIN_FULL_REFRESH_SECONDS: u64 = 5;
 const MAX_TITLE_GAP: usize = 32;
 
 pub struct ConfigManager;
@@ -100,6 +101,11 @@ impl ConfigManager {
         config.text.write_step_ms = config.text.write_step_ms.max(MIN_WRITE_STEP_MS);
 
         config.text.scroll_interval_ms = config.text.scroll_interval_ms.max(MIN_SCROLL_INTERVAL_MS);
+
+        config.text.full_refresh_seconds = config
+            .text
+            .full_refresh_seconds
+            .max(MIN_FULL_REFRESH_SECONDS);
 
         config.text.title_gap = config.text.title_gap.clamp(1, MAX_TITLE_GAP);
 

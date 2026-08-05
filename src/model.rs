@@ -61,6 +61,7 @@ pub struct TextConfig {
     pub write_step_ms: u64,
 
     pub scroll_interval_ms: u64,
+    pub full_refresh_seconds: u64,
     pub title_gap: usize,
     pub separator: String,
 }
@@ -71,6 +72,7 @@ impl Default for TextConfig {
             width: 14,
             write_step_ms: 250,
             scroll_interval_ms: 2000,
+            full_refresh_seconds: 60,
             title_gap: 5,
             separator: " - ".to_owned(),
         }

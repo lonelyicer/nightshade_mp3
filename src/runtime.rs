@@ -4,7 +4,7 @@ use crate::{
     error::AppResult,
     media::MediaWatcher,
     model::AppConfig,
-    osc::{OscSender, WriteEvent},
+    osc::{FrameMode, OscSender, WriteEvent},
     oscquery::{OscEndpoint, OscQueryClient},
     text::TextComposer,
 };
@@ -12,7 +12,7 @@ use crate::{
 use std::time::{Duration, Instant};
 
 use tokio::{
-    sync::mpsc::UnboundedReceiver,
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     time::{Instant as TokioInstant, Interval, MissedTickBehavior, interval_at},
 };
 
@@ -28,6 +28,12 @@ const MIN_WRITE_STEP_MS: u64 = 20;
 struct ConfigChange {
     write_timer_changed: bool,
     discovery_changed: bool,
+    synchronization_reset: bool,
+}
+
+struct DiscoveryMessage {
+    generation: u64,
+    result: AppResult<Option<OscEndpoint>>,
 }
 
 pub async fn run(mut commands: UnboundedReceiver<RuntimeCommand>) -> AppResult<()> {
@@ -47,35 +53,119 @@ pub async fn run(mut commands: UnboundedReceiver<RuntimeCommand>) -> AppResult<(
 
     let mut config_timer = make_timer(CONFIG_CHECK_INTERVAL, MissedTickBehavior::Skip);
 
-    let mut discovery_timer = make_timer(DISCOVERY_INTERVAL, MissedTickBehavior::Delay);
+    let mut discovery_timer = make_timer(DISCOVERY_INTERVAL, MissedTickBehavior::Skip);
 
-    if config.osc.auto_discover && config.oscquery.enabled {
-        discover_and_apply(&config, &mut osc, &mut active_target).await;
-    }
+    let (discovery_sender, mut discovery_receiver) = mpsc::unbounded_channel::<DiscoveryMessage>();
+
+    let mut discovery_generation = 0_u64;
+
+    let mut active_discovery = None::<u64>;
+
+    let mut full_refresh_pending = true;
+
+    let mut last_full_refresh_completed = Instant::now();
+
+    request_discovery(
+        &config,
+        &discovery_sender,
+        &mut discovery_generation,
+        &mut active_discovery,
+    );
 
     tracing::info!(
         write_step_ms = config.text.write_step_ms,
         scroll_interval_ms = config.text.scroll_interval_ms,
+        full_refresh_seconds = config.text.full_refresh_seconds,
         slots = composer.buffer_length(),
         "Backend runtime started"
     );
 
     loop {
         tokio::select! {
+            biased;
+
             command = commands.recv() => {
                 match command {
                     Some(
                         RuntimeCommand::ReloadConfig,
                     ) => {
-                        reload_config(
+                        let next =
+                            match ConfigManager::load() {
+                                Ok(config) => config,
+
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "Could not reload configuration"
+                                    );
+
+                                    continue;
+                                }
+                            };
+
+                        match ConfigManager::modified_time() {
+                            Ok(modified) => {
+                                config_modified =
+                                    modified;
+                            }
+
+                            Err(error) => {
+                                tracing::debug!(
+                                    error = %error,
+                                    "Could not read configuration modification time"
+                                );
+                            }
+                        }
+
+                        match apply_config(
+                            next,
                             &mut config,
-                            &mut config_modified,
                             &mut composer,
                             &mut osc,
                             &mut active_target,
-                            &mut write_timer,
-                        )
-                        .await;
+                        ) {
+                            Ok(change) => {
+                                if change
+                                    .write_timer_changed
+                                {
+                                    write_timer =
+                                        make_write_timer(
+                                            config
+                                                .text
+                                                .write_step_ms,
+                                        );
+                                }
+
+                                if change
+                                    .synchronization_reset
+                                {
+                                    full_refresh_pending =
+                                        true;
+                                }
+
+                                if change
+                                    .discovery_changed
+                                {
+                                    request_discovery(
+                                        &config,
+                                        &discovery_sender,
+                                        &mut discovery_generation,
+                                        &mut active_discovery,
+                                    );
+                                }
+
+                                tracing::info!(
+                                    "Configuration reloaded"
+                                );
+                            }
+
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    "Could not apply reloaded configuration"
+                                );
+                            }
+                        }
                     }
 
                     Some(
@@ -83,6 +173,62 @@ pub async fn run(mut commands: UnboundedReceiver<RuntimeCommand>) -> AppResult<(
                     )
                     | None => {
                         break;
+                    }
+                }
+            }
+
+            message =
+                discovery_receiver.recv()
+            => {
+                let Some(message) =
+                    message
+                else {
+                    continue;
+                };
+
+                if active_discovery
+                    != Some(
+                        message.generation,
+                    )
+                {
+                    continue;
+                }
+
+                active_discovery = None;
+
+                if !config
+                    .osc
+                    .auto_discover
+                    || !config
+                        .oscquery
+                        .enabled
+                {
+                    continue;
+                }
+
+                match message.result {
+                    Ok(Some(endpoint)) => {
+                        if apply_endpoint(
+                            endpoint,
+                            &mut osc,
+                            &mut active_target,
+                        ) {
+                            full_refresh_pending =
+                                true;
+                        }
+                    }
+
+                    Ok(None) => {
+                        tracing::debug!(
+                            "VRChat was not discovered through OSCQuery"
+                        );
+                    }
+
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "OSCQuery discovery failed"
+                        );
                     }
                 }
             }
@@ -100,7 +246,9 @@ pub async fn run(mut commands: UnboundedReceiver<RuntimeCommand>) -> AppResult<(
                             &mut active_target,
                         ) {
                             Ok(change) => {
-                                if change.write_timer_changed {
+                                if change
+                                    .write_timer_changed
+                                {
                                     write_timer =
                                         make_write_timer(
                                             config
@@ -109,20 +257,22 @@ pub async fn run(mut commands: UnboundedReceiver<RuntimeCommand>) -> AppResult<(
                                         );
                                 }
 
-                                if change.discovery_changed
-                                    && config
-                                        .osc
-                                        .auto_discover
-                                    && config
-                                        .oscquery
-                                        .enabled
+                                if change
+                                    .synchronization_reset
                                 {
-                                    discover_and_apply(
+                                    full_refresh_pending =
+                                        true;
+                                }
+
+                                if change
+                                    .discovery_changed
+                                {
+                                    request_discovery(
                                         &config,
-                                        &mut osc,
-                                        &mut active_target,
-                                    )
-                                    .await;
+                                        &discovery_sender,
+                                        &mut discovery_generation,
+                                        &mut active_discovery,
+                                    );
                                 }
                             }
 
@@ -146,19 +296,39 @@ pub async fn run(mut commands: UnboundedReceiver<RuntimeCommand>) -> AppResult<(
                 }
             }
 
-            _ = discovery_timer.tick(),
-            if config.osc.auto_discover
-                && config.oscquery.enabled
-            => {
-                discover_and_apply(
-                    &config,
-                    &mut osc,
-                    &mut active_target,
-                )
-                .await;
+            _ = discovery_timer.tick() => {
+                if active_discovery.is_none() {
+                    request_discovery(
+                        &config,
+                        &discovery_sender,
+                        &mut discovery_generation,
+                        &mut active_discovery,
+                    );
+                }
             }
 
             _ = write_timer.tick() => {
+                let refresh_interval =
+                    Duration::from_secs(
+                        config
+                            .text
+                            .full_refresh_seconds
+                            .max(5),
+                    );
+
+                if !full_refresh_pending
+                    && last_full_refresh_completed
+                        .elapsed()
+                        >= refresh_interval
+                {
+                    full_refresh_pending =
+                        true;
+
+                    tracing::debug!(
+                        "A full display refresh is pending"
+                    );
+                }
+
                 if osc.is_idle() {
                     let media_state =
                         media.borrow().clone();
@@ -172,11 +342,21 @@ pub async fn run(mut commands: UnboundedReceiver<RuntimeCommand>) -> AppResult<(
                             Instant::now(),
                         );
 
+                    let mode =
+                        if full_refresh_pending {
+                            FrameMode::Full
+                        } else {
+                            FrameMode::Delta
+                        };
+
                     match osc.begin_frame(
                         &frame.characters,
+                        mode,
                     ) {
                         Ok(true) => {
                             tracing::trace!(
+                                mode = ?mode,
+
                                 title_offset =
                                     frame.title_offset,
 
@@ -192,7 +372,7 @@ pub async fn run(mut commands: UnboundedReceiver<RuntimeCommand>) -> AppResult<(
                         Err(error) => {
                             tracing::warn!(
                                 error = %error,
-                                "Could not start display frame"
+                                "Could not start a display frame"
                             );
 
                             continue;
@@ -222,7 +402,7 @@ pub async fn run(mut commands: UnboundedReceiver<RuntimeCommand>) -> AppResult<(
                         tracing::trace!(
                             slot,
                             character,
-                            "OSC character latched"
+                            "OSC character sent"
                         );
                     }
 
@@ -235,6 +415,7 @@ pub async fn run(mut commands: UnboundedReceiver<RuntimeCommand>) -> AppResult<(
                         tracing::trace!(
                             slot,
                             character,
+
                             pending =
                                 osc.pending_count(),
 
@@ -246,11 +427,27 @@ pub async fn run(mut commands: UnboundedReceiver<RuntimeCommand>) -> AppResult<(
                         WriteEvent::FrameCompleted {
                             slot,
                             character,
+                            mode,
                         },
                     ) => {
+                        if mode
+                            == FrameMode::Full
+                        {
+                            full_refresh_pending =
+                                false;
+
+                            last_full_refresh_completed =
+                                Instant::now();
+
+                            tracing::debug!(
+                                "Full display refresh completed"
+                            );
+                        }
+
                         tracing::trace!(
                             slot,
                             character,
+                            mode = ?mode,
                             "Frozen display frame completed"
                         );
                     }
@@ -258,7 +455,7 @@ pub async fn run(mut commands: UnboundedReceiver<RuntimeCommand>) -> AppResult<(
                     Err(error) => {
                         tracing::warn!(
                             error = %error,
-                            "Could not advance OSC writer"
+                            "Could not advance the OSC writer"
                         );
                     }
                 }
@@ -269,62 +466,6 @@ pub async fn run(mut commands: UnboundedReceiver<RuntimeCommand>) -> AppResult<(
     tracing::info!("Backend runtime stopped");
 
     Ok(())
-}
-
-async fn reload_config(
-    config: &mut AppConfig,
-    config_modified: &mut Option<std::time::SystemTime>,
-    composer: &mut TextComposer,
-    osc: &mut OscSender,
-    active_target: &mut (String, u16),
-    write_timer: &mut Interval,
-) {
-    let next = match ConfigManager::load() {
-        Ok(config) => config,
-
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Could not reload configuration"
-            );
-
-            return;
-        }
-    };
-
-    match ConfigManager::modified_time() {
-        Ok(modified) => {
-            *config_modified = modified;
-        }
-
-        Err(error) => {
-            tracing::debug!(
-                error = %error,
-                "Could not read configuration modification time"
-            );
-        }
-    }
-
-    match apply_config(next, config, composer, osc, active_target) {
-        Ok(change) => {
-            if change.write_timer_changed {
-                *write_timer = make_write_timer(config.text.write_step_ms);
-            }
-
-            if change.discovery_changed && config.osc.auto_discover && config.oscquery.enabled {
-                discover_and_apply(config, osc, active_target).await;
-            }
-
-            tracing::info!("Configuration reloaded");
-        }
-
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Could not apply reloaded configuration"
-            );
-        }
-    }
 }
 
 fn apply_config(
@@ -351,20 +492,18 @@ fn apply_config(
 
     let discovery_changed = current.osc != next.osc || current.oscquery != next.oscquery;
 
+    let mut synchronization_reset = false;
+
     if configured_target_changed || automatic_discovery_disabled {
-        osc.set_target(&next.osc.host, next.osc.port)?;
+        if osc.set_target(&next.osc.host, next.osc.port)? {
+            synchronization_reset = true;
+        }
 
         *active_target = (next.osc.host.clone(), next.osc.port);
-
-        tracing::info!(
-            host = %next.osc.host,
-            port = next.osc.port,
-            "Configured OSC target applied"
-        );
     }
 
-    if parameters_changed {
-        osc.set_parameters(&next.parameters)?;
+    if parameters_changed && osc.set_parameters(&next.parameters)? {
+        synchronization_reset = true;
     }
 
     if text_changed {
@@ -375,6 +514,8 @@ fn apply_config(
         );
 
         osc.reset_sync(next.text.width * 2)?;
+
+        synchronization_reset = true;
     }
 
     *current = next;
@@ -382,63 +523,73 @@ fn apply_config(
     Ok(ConfigChange {
         write_timer_changed,
         discovery_changed,
+        synchronization_reset,
     })
 }
 
-async fn discover_and_apply(
+fn request_discovery(
     config: &AppConfig,
-    osc: &mut OscSender,
-    active_target: &mut (String, u16),
+    sender: &UnboundedSender<DiscoveryMessage>,
+    generation: &mut u64,
+    active: &mut Option<u64>,
 ) {
-    let client = match OscQueryClient::new(config.oscquery.clone()) {
-        Ok(client) => client,
+    *generation = generation.wrapping_add(1);
 
-        Err(error) => {
-            tracing::debug!(
-                error = %error,
-                "Could not initialize OSCQuery"
-            );
+    let current_generation = *generation;
 
-            return;
-        }
-    };
+    *active = None;
 
-    let endpoint = match client.discover(DISCOVERY_TIMEOUT).await {
-        Ok(Some(endpoint)) => endpoint,
-
-        Ok(None) => {
-            tracing::debug!("VRChat was not discovered through OSCQuery");
-
-            return;
-        }
-
-        Err(error) => {
-            tracing::debug!(
-                error = %error,
-                "OSCQuery discovery failed"
-            );
-
-            return;
-        }
-    };
-
-    apply_endpoint(endpoint, osc, active_target);
-}
-
-fn apply_endpoint(endpoint: OscEndpoint, osc: &mut OscSender, active_target: &mut (String, u16)) {
-    if active_target.0 == endpoint.host && active_target.1 == endpoint.port {
+    if !config.osc.auto_discover || !config.oscquery.enabled {
         return;
     }
 
-    match osc.set_target(&endpoint.host, endpoint.port) {
-        Ok(()) => {
-            tracing::info!(
-                host = %endpoint.host,
-                port = endpoint.port,
-                "VRChat OSC target discovered"
-            );
+    let oscquery_config = config.oscquery.clone();
 
+    let sender = sender.clone();
+
+    *active = Some(current_generation);
+
+    tokio::spawn(async move {
+        let result = match OscQueryClient::new(oscquery_config) {
+            Ok(client) => client.discover(DISCOVERY_TIMEOUT).await,
+
+            Err(error) => Err(error),
+        };
+
+        let _ = sender.send(DiscoveryMessage {
+            generation: current_generation,
+
+            result,
+        });
+    });
+}
+
+fn apply_endpoint(
+    endpoint: OscEndpoint,
+    osc: &mut OscSender,
+    active_target: &mut (String, u16),
+) -> bool {
+    if active_target.0 == endpoint.host && active_target.1 == endpoint.port {
+        return false;
+    }
+
+    match osc.set_target(&endpoint.host, endpoint.port) {
+        Ok(changed) => {
             *active_target = (endpoint.host, endpoint.port);
+
+            if changed {
+                tracing::info!(
+                    host =
+                        %active_target.0,
+
+                    port =
+                        active_target.1,
+
+                    "VRChat OSC target discovered"
+                );
+            }
+
+            changed
         }
 
         Err(error) => {
@@ -448,6 +599,8 @@ fn apply_endpoint(endpoint: OscEndpoint, osc: &mut OscSender, active_target: &mu
                 error = %error,
                 "Could not apply discovered OSC target"
             );
+
+            false
         }
     }
 }

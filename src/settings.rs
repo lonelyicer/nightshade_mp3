@@ -24,8 +24,8 @@ pub fn run() -> AppResult<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Nightshade MP3 Settings")
-            .with_inner_size([300.0, 550.0])
-            .with_min_inner_size([300.0, 550.0])
+            .with_inner_size([300.0, 600.0])
+            .with_min_inner_size([300.0, 600.0])
             .with_icon(window_icon),
 
         centered: true,
@@ -136,6 +136,12 @@ impl eframe::App for SettingsApp {
 
             ui.add(egui::DragValue::new(&mut self.config.text.title_gap).range(1..=32));
 
+            ui.label("Full refresh interval in seconds");
+
+            ui.add(
+                egui::DragValue::new(&mut self.config.text.full_refresh_seconds).range(5..=3_600),
+            );
+
             ui.add_space(12.0);
 
             ui.horizontal(|ui| {
@@ -190,6 +196,10 @@ fn validate(config: &AppConfig) -> Result<(), String> {
 
     if config.text.title_gap == 0 {
         return Err("Title gap must be at least one character.".to_owned());
+    }
+
+    if config.text.full_refresh_seconds < 5 {
+        return Err("Full refresh interval must be at least five seconds.".to_owned());
     }
 
     Ok(())

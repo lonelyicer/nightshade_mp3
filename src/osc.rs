@@ -11,6 +11,14 @@ const POINTER_PHASE_OFFSET: i32 = 32;
 const POINTER_PRIME_VALUE: i32 = 63;
 const MAX_SLOT_COUNT: usize = 31;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FrameMode {
+    #[default]
+    Delta,
+
+    Full,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum WritePhase {
     PrimePointer,
@@ -26,11 +34,21 @@ pub enum WriteEvent {
 
     PointerPrimed,
 
-    CharacterSent { slot: usize, character: i32 },
+    CharacterSent {
+        slot: usize,
+        character: i32,
+    },
 
-    SlotCommitted { slot: usize, character: i32 },
+    SlotCommitted {
+        slot: usize,
+        character: i32,
+    },
 
-    FrameCompleted { slot: usize, character: i32 },
+    FrameCompleted {
+        slot: usize,
+        character: i32,
+        mode: FrameMode,
+    },
 }
 
 pub struct OscSender {
@@ -46,6 +64,7 @@ pub struct OscSender {
     pending_slots: Vec<usize>,
     pending_index: usize,
 
+    frame_mode: FrameMode,
     phase: WritePhase,
     last_pointer: Option<i32>,
 }
@@ -73,9 +92,11 @@ impl OscSender {
 
             target_frame: vec![i32::MIN; slot_count],
 
-            pending_slots: Vec::new(),
+            pending_slots: Vec::with_capacity(slot_count),
 
             pending_index: 0,
+
+            frame_mode: FrameMode::Delta,
 
             phase: WritePhase::PrimePointer,
 
@@ -83,8 +104,12 @@ impl OscSender {
         })
     }
 
-    pub fn set_target(&mut self, host: &str, port: u16) -> AppResult<()> {
+    pub fn set_target(&mut self, host: &str, port: u16) -> AppResult<bool> {
         let target = resolve_target(host, port)?;
+
+        if self.target == target {
+            return Ok(false);
+        }
 
         if target.is_ipv4() != self.target.is_ipv4() {
             self.socket = bind_socket(target)?;
@@ -94,21 +119,23 @@ impl OscSender {
 
         self.reset_sync(self.committed.len())?;
 
-        Ok(())
+        Ok(true)
     }
 
-    pub fn set_parameters(&mut self, parameters: &ParameterConfig) -> AppResult<()> {
+    pub fn set_parameters(&mut self, parameters: &ParameterConfig) -> AppResult<bool> {
         if self.pointer_parameter == parameters.pointer
             && self.character_parameter == parameters.character
         {
-            return Ok(());
+            return Ok(false);
         }
 
         self.pointer_parameter = parameters.pointer.clone();
 
         self.character_parameter = parameters.character.clone();
 
-        self.reset_sync(self.committed.len())
+        self.reset_sync(self.committed.len())?;
+
+        Ok(true)
     }
 
     pub fn reset_sync(&mut self, slot_count: usize) -> AppResult<()> {
@@ -118,8 +145,11 @@ impl OscSender {
 
         self.target_frame = vec![i32::MIN; slot_count];
 
-        self.pending_slots.clear();
+        self.pending_slots = Vec::with_capacity(slot_count);
+
         self.pending_index = 0;
+
+        self.frame_mode = FrameMode::Delta;
 
         self.phase = WritePhase::PrimePointer;
 
@@ -129,10 +159,10 @@ impl OscSender {
     }
 
     pub fn is_idle(&self) -> bool {
-        matches!(self.phase, WritePhase::Ready) && self.pending_index >= self.pending_slots.len()
+        matches!(self.phase, WritePhase::Ready,) && self.pending_index >= self.pending_slots.len()
     }
 
-    pub fn begin_frame(&mut self, frame: &[i32]) -> AppResult<bool> {
+    pub fn begin_frame(&mut self, frame: &[i32], mode: FrameMode) -> AppResult<bool> {
         validate_slot_count(frame.len())?;
 
         if !self.is_idle() {
@@ -149,20 +179,29 @@ impl OscSender {
 
         self.pending_slots.clear();
         self.pending_index = 0;
+        self.frame_mode = mode;
 
-        self.pending_slots.extend(
-            self.target_frame
-                .iter()
-                .zip(self.committed.iter())
-                .enumerate()
-                .filter_map(|(slot, (target, committed))| {
-                    if target != committed {
-                        Some(slot)
-                    } else {
-                        None
-                    }
-                }),
-        );
+        match mode {
+            FrameMode::Delta => {
+                self.pending_slots.extend(
+                    self.target_frame
+                        .iter()
+                        .zip(self.committed.iter())
+                        .enumerate()
+                        .filter_map(|(slot, (target, committed))| {
+                            if target != committed {
+                                Some(slot)
+                            } else {
+                                None
+                            }
+                        }),
+                );
+            }
+
+            FrameMode::Full => {
+                self.pending_slots.extend(0..frame.len());
+            }
+        }
 
         Ok(!self.pending_slots.is_empty())
     }
@@ -211,10 +250,17 @@ impl OscSender {
                 self.phase = WritePhase::Ready;
 
                 if self.pending_index >= self.pending_slots.len() {
+                    let mode = self.frame_mode;
+
                     self.pending_slots.clear();
                     self.pending_index = 0;
+                    self.frame_mode = FrameMode::Delta;
 
-                    Ok(WriteEvent::FrameCompleted { slot, character })
+                    Ok(WriteEvent::FrameCompleted {
+                        slot,
+                        character,
+                        mode,
+                    })
                 } else {
                     Ok(WriteEvent::SlotCommitted { slot, character })
                 }
@@ -281,7 +327,7 @@ fn resolve_target(host: &str, port: u16) -> AppResult<SocketAddr> {
         .ok_or_else(|| {
             AppError::Message(format!(
                 "Could not resolve OSC target \
-                         {host}:{port}."
+                     {host}:{port}."
             ))
         })
 }
