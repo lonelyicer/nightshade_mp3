@@ -5,6 +5,7 @@ mod clock;
 mod command;
 mod config;
 mod error;
+mod instance;
 mod media;
 mod model;
 mod osc;
@@ -13,8 +14,12 @@ mod runtime;
 mod settings;
 mod text;
 mod tray;
+mod icon;
 
-use crate::error::AppResult;
+use crate::{
+    error::AppResult,
+    instance::{AppInstance, InstanceState},
+};
 
 use tokio::{runtime::Builder, sync::mpsc::unbounded_channel};
 
@@ -27,20 +32,36 @@ fn main() -> AppResult<()> {
         return settings::run();
     }
 
+    let _instance = match AppInstance::acquire()? {
+        InstanceState::Primary(instance) => instance,
+
+        InstanceState::AlreadyRunning => {
+            tracing::info!("Another Nightshade MP3 instance is already running");
+
+            return Ok(());
+        }
+    };
+
     let backend_runtime = Builder::new_multi_thread().enable_all().build()?;
 
     let (runtime_sender, runtime_receiver) = unbounded_channel();
 
-    let _backend_task = backend_runtime.spawn(async move {
+    let backend_task = backend_runtime.spawn(async move {
         if let Err(error) = runtime::run(runtime_receiver).await {
             tracing::error!(
                 error = %error,
-                "backend runtime stopped"
+                "Backend runtime stopped unexpectedly"
             );
         }
     });
 
-    tray::run(runtime_sender)
+    let tray_result = tray::run(runtime_sender.clone());
+
+    let _ = runtime_sender.send(command::RuntimeCommand::Shutdown);
+
+    backend_task.abort();
+
+    tray_result
 }
 
 fn settings_mode() -> bool {
