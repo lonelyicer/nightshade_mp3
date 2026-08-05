@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+
 use std::time::Instant;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -43,28 +44,24 @@ impl Default for OscConfig {
 #[serde(default)]
 pub struct OscQueryConfig {
     pub enabled: bool,
-    pub host: String,
-    pub port: u16,
 }
 
 impl Default for OscQueryConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            host: "127.0.0.1".to_owned(),
-            port: 9001,
-        }
+        Self { enabled: true }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TextConfig {
-    #[serde(alias = "columns")]
     pub width: usize,
-    pub update_interval_ms: u64,
+
+    #[serde(alias = "update_interval_ms")]
+    pub write_step_ms: u64,
+
     pub scroll_interval_ms: u64,
-    pub full_refresh_seconds: u64,
+    pub title_gap: usize,
     pub separator: String,
 }
 
@@ -72,9 +69,9 @@ impl Default for TextConfig {
     fn default() -> Self {
         Self {
             width: 14,
-            update_interval_ms: 100,
-            scroll_interval_ms: 500,
-            full_refresh_seconds: 30,
+            write_step_ms: 250,
+            scroll_interval_ms: 2000,
+            title_gap: 5,
             separator: " - ".to_owned(),
         }
     }
@@ -111,12 +108,16 @@ impl MediaInfo {
     }
 
     pub fn display_name(&self, separator: &str) -> String {
-        match (self.title.trim().is_empty(), self.artist.trim().is_empty()) {
+        let title = self.title.trim();
+        let artist = self.artist.trim();
+
+        match (title.is_empty(), artist.is_empty()) {
             (false, false) => {
-                format!("{}{}{}", self.title.trim(), separator, self.artist.trim())
+                format!("{title}{separator}{artist}")
             }
-            (false, true) => self.title.trim().to_owned(),
-            (true, false) => self.artist.trim().to_owned(),
+
+            (false, true) => title.to_owned(),
+            (true, false) => artist.to_owned(),
             (true, true) => String::new(),
         }
     }
@@ -144,11 +145,11 @@ impl MediaState {
     }
 
     pub fn current_position(&self) -> f64 {
-        let position = if self.info.playing {
-            self.info.position + self.updated_at.elapsed().as_secs_f64()
-        } else {
-            self.info.position
-        };
+        let mut position = self.info.position;
+
+        if self.info.playing {
+            position += self.updated_at.elapsed().as_secs_f64();
+        }
 
         if self.info.duration > 0.0 {
             position.clamp(0.0, self.info.duration)
@@ -156,10 +157,4 @@ impl MediaState {
             position.max(0.0)
         }
     }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TextFrame {
-    pub line1: String,
-    pub line2: String,
 }

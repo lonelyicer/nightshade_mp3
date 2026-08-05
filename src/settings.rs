@@ -5,12 +5,13 @@ use crate::{
 };
 
 use eframe::egui;
+
 use std::process::Command;
 
 pub fn launch() -> AppResult<()> {
-    let executable = std::env::current_exe()?;
-
-    Command::new(executable).arg("--settings").spawn()?;
+    Command::new(std::env::current_exe()?)
+        .arg("--settings")
+        .spawn()?;
 
     Ok(())
 }
@@ -18,10 +19,22 @@ pub fn launch() -> AppResult<()> {
 pub fn run() -> AppResult<()> {
     let config = ConfigManager::load()?;
 
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([300.0, 550.0])
+            .with_min_inner_size([300.0, 550.0]),
+
+        centered: true,
+
+        renderer: eframe::Renderer::Glow,
+
+        ..Default::default()
+    };
+
     eframe::run_native(
         "Nightshade MP3 Settings",
-        eframe::NativeOptions::default(),
-        Box::new(move |_creation_context| Ok(Box::new(SettingsApp::new(config)))),
+        options,
+        Box::new(move |_context| Ok(Box::new(SettingsApp::new(config)))),
     )
     .map_err(|error| AppError::Message(error.to_string()))
 }
@@ -40,19 +53,21 @@ impl SettingsApp {
     }
 
     fn save(&mut self) -> bool {
-        if let Err(message) = validate_config(&self.config) {
-            self.status = message;
+        if let Err(error) = validate(&self.config) {
+            self.status = error;
             return false;
         }
 
         match ConfigManager::save(&self.config) {
             Ok(()) => {
                 self.status = "Configuration saved.".to_owned();
+
                 true
             }
 
             Err(error) => {
                 self.status = format!("Failed to save configuration: {error}");
+
                 false
             }
         }
@@ -64,7 +79,6 @@ impl eframe::App for SettingsApp {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Nightshade MP3");
 
-            ui.add_space(8.0);
             ui.separator();
 
             ui.heading("OSC");
@@ -79,17 +93,11 @@ impl eframe::App for SettingsApp {
 
             ui.checkbox(
                 &mut self.config.osc.auto_discover,
-                "Automatically discover VRChat with OSCQuery",
+                "Automatically discover VRChat",
             );
-
-            ui.add_space(8.0);
-            ui.separator();
-
-            ui.heading("OSCQuery");
 
             ui.checkbox(&mut self.config.oscquery.enabled, "Enable OSCQuery");
 
-            ui.add_space(8.0);
             ui.separator();
 
             ui.heading("Avatar Parameters");
@@ -102,41 +110,29 @@ impl eframe::App for SettingsApp {
 
             ui.text_edit_singleline(&mut self.config.parameters.character);
 
-            ui.add_space(8.0);
             ui.separator();
 
             ui.heading("Text");
-
-            ui.horizontal(|ui| {
-                ui.label("Characters per line");
-
-                ui.label(self.config.text.width.to_string());
-            });
 
             ui.label("Title and artist separator");
 
             ui.text_edit_singleline(&mut self.config.text.separator);
 
-            ui.label("Update interval in milliseconds");
+            ui.label("OSC write step in milliseconds");
 
-            ui.add(
-                egui::DragValue::new(&mut self.config.text.update_interval_ms).range(50..=60_000),
-            );
+            ui.add(egui::DragValue::new(&mut self.config.text.write_step_ms).range(20..=1_000));
 
-            ui.label("Scroll interval in milliseconds");
+            ui.label("Title scroll interval in milliseconds");
 
             ui.add(
                 egui::DragValue::new(&mut self.config.text.scroll_interval_ms).range(100..=60_000),
             );
 
-            ui.label("Full refresh interval in seconds");
+            ui.label("Title gap");
 
-            ui.add(
-                egui::DragValue::new(&mut self.config.text.full_refresh_seconds).range(5..=3_600),
-            );
+            ui.add(egui::DragValue::new(&mut self.config.text.title_gap).range(1..=32));
 
             ui.add_space(12.0);
-            ui.separator();
 
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
@@ -149,33 +145,27 @@ impl eframe::App for SettingsApp {
 
                 if ui.button("Restore Defaults").clicked() {
                     self.config = AppConfig::default();
-                    self.status = "Default values restored but not saved.".to_owned();
+
+                    self.status = "Defaults restored but not saved.".to_owned();
                 }
             });
 
             if !self.status.is_empty() {
                 ui.add_space(8.0);
-                ui.label(self.status.as_str());
+
+                ui.label(&self.status);
             }
         });
     }
 }
 
-fn validate_config(config: &AppConfig) -> Result<(), String> {
+fn validate(config: &AppConfig) -> Result<(), String> {
     if config.osc.host.trim().is_empty() {
         return Err("OSC host cannot be empty.".to_owned());
     }
 
     if config.osc.port == 0 {
         return Err("OSC port cannot be zero.".to_owned());
-    }
-
-    if config.oscquery.enabled && config.oscquery.host.trim().is_empty() {
-        return Err("OSCQuery host cannot be empty.".to_owned());
-    }
-
-    if config.oscquery.enabled && config.oscquery.port == 0 {
-        return Err("OSCQuery port cannot be zero.".to_owned());
     }
 
     if config.parameters.pointer.trim().is_empty() {
@@ -186,8 +176,16 @@ fn validate_config(config: &AppConfig) -> Result<(), String> {
         return Err("Character parameter cannot be empty.".to_owned());
     }
 
-    if config.text.separator.chars().count() > 8 {
-        return Err("The separator cannot contain more than eight characters.".to_owned());
+    if config.text.write_step_ms < 20 {
+        return Err("OSC write step must be at least 20 milliseconds.".to_owned());
+    }
+
+    if config.text.scroll_interval_ms < 100 {
+        return Err("Title scroll interval must be at least 100 milliseconds.".to_owned());
+    }
+
+    if config.text.title_gap == 0 {
+        return Err("Title gap must be at least one character.".to_owned());
     }
 
     Ok(())

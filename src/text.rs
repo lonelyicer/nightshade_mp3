@@ -1,58 +1,75 @@
 use crate::{
     charset::{encode_fixed, supported_text},
     clock::{EMPTY_PROGRESS, format_progress},
-    model::{MediaState, TextFrame},
+    model::MediaState,
 };
+
 use std::time::{Duration, Instant};
+
+const MIN_SCROLL_INTERVAL_MS: u64 = 100;
+
+#[derive(Clone, Debug)]
+pub struct DisplayFrame {
+    pub characters: Vec<i32>,
+    pub title_offset: usize,
+}
 
 pub struct TextComposer {
     width: usize,
     scroll_interval: Duration,
+    title_gap: usize,
+
     source_text: String,
-    scroll_buffer: Vec<char>,
-    offset: usize,
-    last_scroll: Instant,
+    title_ring: Vec<char>,
+    title_started_at: Instant,
 }
 
 impl TextComposer {
-    pub fn new(width: usize, scroll_interval_ms: u64) -> Self {
+    pub fn new(width: usize, scroll_interval_ms: u64, title_gap: usize) -> Self {
         Self {
-            width,
-            scroll_interval: Duration::from_millis(scroll_interval_ms.max(100)),
+            width: width.max(1),
+
+            scroll_interval: Duration::from_millis(scroll_interval_ms.max(MIN_SCROLL_INTERVAL_MS)),
+
+            title_gap: title_gap.max(1),
+
             source_text: String::new(),
-            scroll_buffer: Vec::new(),
-            offset: 0,
-            last_scroll: Instant::now(),
+
+            title_ring: Vec::new(),
+
+            title_started_at: Instant::now(),
         }
     }
 
-    pub fn reconfigure(&mut self, width: usize, scroll_interval_ms: u64) {
+    pub fn reconfigure(&mut self, width: usize, scroll_interval_ms: u64, title_gap: usize) {
         self.width = width.max(1);
-        self.scroll_interval = Duration::from_millis(scroll_interval_ms.max(100));
-        self.source_text.clear();
-        self.scroll_buffer.clear();
-        self.offset = 0;
-        self.last_scroll = Instant::now();
+
+        self.scroll_interval =
+            Duration::from_millis(scroll_interval_ms.max(MIN_SCROLL_INTERVAL_MS));
+
+        self.title_gap = title_gap.max(1);
+
+        self.rebuild_title_ring();
+
+        self.title_started_at = Instant::now();
     }
 
-    pub fn compose(&mut self, media: &MediaState, separator: &str) -> TextFrame {
-        let display_name = if media.info.is_available() {
+    pub fn buffer_length(&self) -> usize {
+        self.width * 2
+    }
+
+    pub fn compose(&mut self, media: &MediaState, separator: &str, now: Instant) -> DisplayFrame {
+        let source = if media.info.is_available() {
             supported_text(&media.info.display_name(separator))
         } else {
             String::new()
         };
 
-        self.set_source(display_name);
+        self.set_source(source, now);
 
-        if self.scroll_buffer.len() > self.width
-            && self.last_scroll.elapsed() >= self.scroll_interval
-        {
-            self.offset = (self.offset + 1) % self.scroll_buffer.len();
+        let title_offset = self.title_offset(now);
 
-            self.last_scroll = Instant::now();
-        }
-
-        let line1 = self.current_line();
+        let title = self.render_title(title_offset);
 
         let progress = if media.info.is_available() {
             format_progress(media.current_position(), media.info.duration)
@@ -60,60 +77,73 @@ impl TextComposer {
             EMPTY_PROGRESS.to_owned()
         };
 
-        TextFrame {
-            line1,
-            line2: fit_text(&progress, self.width),
+        let progress = fit_text(&progress, self.width);
+
+        let mut unified = String::with_capacity(self.width * 2);
+
+        unified.push_str(&title);
+        unified.push_str(&progress);
+
+        DisplayFrame {
+            characters: encode_fixed(&unified, self.width * 2),
+
+            title_offset,
         }
     }
 
-    pub fn frame_to_ids(&self, frame: &TextFrame) -> Vec<i32> {
-        let mut output = Vec::with_capacity(self.width * 2);
+    fn set_source(&mut self, source: String, now: Instant) {
+        let source = source.trim().to_owned();
 
-        output.extend(encode_fixed(&frame.line1, self.width));
-
-        output.extend(encode_fixed(&frame.line2, self.width));
-
-        output
-    }
-
-    fn set_source(&mut self, text: String) {
-        let normalized = text.trim().to_owned();
-
-        if normalized == self.source_text {
+        if source == self.source_text {
             return;
         }
 
-        self.source_text = normalized;
-        self.offset = 0;
-        self.last_scroll = Instant::now();
+        self.source_text = source;
 
-        if self.source_text.is_empty() {
-            self.scroll_buffer = vec![' '; self.width];
+        self.rebuild_title_ring();
+
+        self.title_started_at = now;
+    }
+
+    fn rebuild_title_ring(&mut self) {
+        self.title_ring = self.source_text.chars().collect();
+
+        if self.title_ring.is_empty() {
+            self.title_ring = vec![' '; self.width];
 
             return;
         }
 
-        self.scroll_buffer = self.source_text.chars().collect();
-
-        if self.scroll_buffer.len() > self.width {
-            self.scroll_buffer.extend([' ', ' ', ' ']);
+        if self.title_ring.len() > self.width {
+            self.title_ring
+                .extend(std::iter::repeat_n(' ', self.title_gap));
         }
     }
 
-    fn current_line(&self) -> String {
-        if self.scroll_buffer.is_empty() {
-            return " ".repeat(self.width);
+    fn title_offset(&self, now: Instant) -> usize {
+        if self.title_ring.len() <= self.width {
+            return 0;
         }
 
-        if self.scroll_buffer.len() <= self.width {
-            return fit_chars(&self.scroll_buffer, self.width);
+        let elapsed = now.saturating_duration_since(self.title_started_at);
+
+        let interval_nanos = self.scroll_interval.as_nanos().max(1);
+
+        let elapsed_steps = elapsed.as_nanos() / interval_nanos;
+
+        (elapsed_steps % self.title_ring.len() as u128) as usize
+    }
+
+    fn render_title(&self, offset: usize) -> String {
+        if self.title_ring.len() <= self.width {
+            return fit_chars(&self.title_ring, self.width);
         }
 
         (0..self.width)
             .map(|index| {
-                let position = (self.offset + index) % self.scroll_buffer.len();
+                let position = (offset + index) % self.title_ring.len();
 
-                self.scroll_buffer[position]
+                self.title_ring[position]
             })
             .collect()
     }
@@ -126,13 +156,13 @@ fn fit_text(text: &str, width: usize) -> String {
 }
 
 fn fit_chars(characters: &[char], width: usize) -> String {
-    let mut result = characters.iter().take(width).copied().collect::<String>();
+    let mut output = characters.iter().take(width).copied().collect::<String>();
 
-    let current = result.chars().count();
+    let length = output.chars().count();
 
-    if current < width {
-        result.push_str(&" ".repeat(width - current));
+    if length < width {
+        output.push_str(&" ".repeat(width - length));
     }
 
-    result
+    output
 }

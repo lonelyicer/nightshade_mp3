@@ -2,18 +2,24 @@ use crate::{
     error::{AppError, AppResult},
     model::AppConfig,
 };
+
 use directories::ProjectDirs;
+
 use std::{fs, path::PathBuf, time::SystemTime};
+
+const DISPLAY_WIDTH: usize = 14;
+const MIN_WRITE_STEP_MS: u64 = 20;
+const MIN_SCROLL_INTERVAL_MS: u64 = 100;
+const MAX_TITLE_GAP: usize = 32;
 
 pub struct ConfigManager;
 
 impl ConfigManager {
     pub fn directory() -> AppResult<PathBuf> {
-        let directories = ProjectDirs::from("im", "ringlo", "nightshade_mp3").ok_or_else(|| {
-            AppError::Message(
-                "could not resolve the application configuration directory".to_owned(),
-            )
-        })?;
+        let directories =
+            ProjectDirs::from("com", "nightshade", "nightshade_mp3").ok_or_else(|| {
+                AppError::Message("Could not resolve the configuration directory.".to_owned())
+            })?;
 
         Ok(directories.config_dir().to_path_buf())
     }
@@ -26,44 +32,40 @@ impl ConfigManager {
         let path = Self::path()?;
 
         if !path.exists() {
-            let config = AppConfig::default();
+            let config = Self::normalize(AppConfig::default());
+
             Self::save(&config)?;
+
             return Ok(config);
         }
 
-        let content = fs::read_to_string(path)?;
-        let mut config: AppConfig = serde_json::from_str(&content)?;
+        let text = fs::read_to_string(path)?;
 
-        config.text.width = 14;
-        config.text.update_interval_ms = config.text.update_interval_ms.max(50);
-        config.text.scroll_interval_ms = config.text.scroll_interval_ms.max(100);
-        config.text.full_refresh_seconds = config.text.full_refresh_seconds.max(5);
+        let config = serde_json::from_str::<AppConfig>(&text)?;
 
-        Ok(config)
+        Ok(Self::normalize(config))
     }
 
     pub fn save(config: &AppConfig) -> AppResult<()> {
         let directory = Self::directory()?;
+
         fs::create_dir_all(&directory)?;
 
         let path = Self::path()?;
-        let temporary_path = directory.join("config.json.tmp");
 
-        let mut normalized = config.clone();
-        normalized.text.width = 14;
-        normalized.text.update_interval_ms = normalized.text.update_interval_ms.max(50);
-        normalized.text.scroll_interval_ms = normalized.text.scroll_interval_ms.max(100);
-        normalized.text.full_refresh_seconds = normalized.text.full_refresh_seconds.max(5);
+        let temporary = directory.join("config.json.tmp");
 
-        let content = serde_json::to_string_pretty(&normalized)?;
+        let config = Self::normalize(config.clone());
 
-        fs::write(&temporary_path, content)?;
+        let text = serde_json::to_string_pretty(&config)?;
+
+        fs::write(&temporary, text)?;
 
         if path.exists() {
             fs::remove_file(&path)?;
         }
 
-        fs::rename(temporary_path, path)?;
+        fs::rename(temporary, path)?;
 
         Ok(())
     }
@@ -86,8 +88,25 @@ impl ConfigManager {
         }
 
         let config = Self::load()?;
+
         *previous = current;
 
         Ok(Some(config))
+    }
+
+    fn normalize(mut config: AppConfig) -> AppConfig {
+        config.text.width = DISPLAY_WIDTH;
+
+        config.text.write_step_ms = config.text.write_step_ms.max(MIN_WRITE_STEP_MS);
+
+        config.text.scroll_interval_ms = config.text.scroll_interval_ms.max(MIN_SCROLL_INTERVAL_MS);
+
+        config.text.title_gap = config.text.title_gap.clamp(1, MAX_TITLE_GAP);
+
+        if config.text.separator.chars().count() > 8 {
+            config.text.separator = config.text.separator.chars().take(8).collect();
+        }
+
+        config
     }
 }
