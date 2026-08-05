@@ -2,6 +2,7 @@
 name = "nightshade_mp3"
 version = "0.1.0"
 edition = "2024"
+authors = ["RingLo_"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
@@ -20,6 +21,10 @@ tao = "0.36.0"
 eframe = { version = "0.36.0", default-features = false, features = ["glow", "default_fonts"] }
 win-gsmtc = "0.1"
 single-instance = "0.3.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+winres = "0.1.12"
 
 [profile.release]
 lto = true
@@ -28,3 +33,13 @@ panic = "abort"
 opt-level = "z"
 debug = false
 strip = true
+
+[package.metadata.winres]
+ProductName = "Nightshade MP3"
+FileDescription = "Nightshade MP3 Gimmick OSC sender"
+CompanyName = "R3C"
+LegalCopyright = "Copyright © 2026 RingLo_"
+LegalTrademark = ""
+OriginalFilename = "nightshade_mp3.exe"
+InternalName = "nightshade_mp3"
+Comments = "Licensed under the PolyForm Noncommercial License 1.0.0; commercial licensing available separately."

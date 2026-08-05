@@ -55,6 +55,11 @@ pub fn run(runtime_sender: UnboundedSender<RuntimeCommand>) -> AppResult<()> {
     let menu_items = (settings_item, reload_item, exit_item);
 
     let mut menu_slot = Some(menu);
+
+    let tray_image = crate::icon::tray_icon()?;
+
+    let mut icon_slot = Some(tray_image);
+
     let mut tray_icon = None::<TrayIcon>;
 
     event_loop.run(move |event, _event_loop_target, control_flow| {
@@ -72,8 +77,13 @@ pub fn run(runtime_sender: UnboundedSender<RuntimeCommand>) -> AppResult<()> {
                     return;
                 };
 
+                let Some(icon) = icon_slot.take() else {
+                    return;
+                };
+
                 match TrayIconBuilder::new()
                     .with_tooltip("Nightshade MP3")
+                    .with_icon(icon)
                     .with_menu(Box::new(menu))
                     .build()
                 {

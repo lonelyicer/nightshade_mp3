@@ -19,10 +19,14 @@ pub fn launch() -> AppResult<()> {
 pub fn run() -> AppResult<()> {
     let config = ConfigManager::load()?;
 
+    let window_icon = crate::icon::window_icon()?;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_title("Nightshade MP3 Settings")
             .with_inner_size([300.0, 550.0])
-            .with_min_inner_size([300.0, 550.0]),
+            .with_min_inner_size([300.0, 550.0])
+            .with_icon(window_icon),
 
         centered: true,
 

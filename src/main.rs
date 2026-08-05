@@ -5,6 +5,7 @@ mod clock;
 mod command;
 mod config;
 mod error;
+mod icon;
 mod instance;
 mod media;
 mod model;
@@ -14,7 +15,6 @@ mod runtime;
 mod settings;
 mod text;
 mod tray;
-mod icon;
 
 use crate::{
     error::AppResult,
